@@ -1,0 +1,400 @@
+#!/bin/bash
+# headless: make a Mac mini usable with no monitor, and reachable from anywhere.
+# Works with the bash that ships with macOS (3.2). Safe to rerun; finished steps are skipped.
+
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+LABEL="dev.headless-mac.display"
+OLD_LABELS="${HEADLESS_OLD_LABELS:-}"   # labels from earlier installs, to replace
+BIN="$HOME/.local/bin/factory-display"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+DISPLAY_LOG="$HOME/Library/Logs/factory-display.log"
+CF_DIR="$HOME/.cloudflared"
+CF_LABEL="com.cloudflare.cloudflared"
+CF_PLIST="$HOME/Library/LaunchAgents/$CF_LABEL.plist"
+STATE="$HOME/.config/headless/state"
+GUI="gui/$(id -u)"
+BREW="$(command -v brew || echo /opt/homebrew/bin/brew)"
+
+usage() {
+  cat <<'EOF'
+usage: headless <command>
+
+On the Mac mini:
+  setup                       no sleep, restart after power loss, Remote Login, virtual screen
+  display install             build the virtual screen and start it at every login
+  display uninstall           stop it and remove it
+  display status              say whether it is running and at what size
+  remote cloudflare <host>    reach SSH from anywhere through your own Cloudflare domain,
+                              for example: headless remote cloudflare mini.example.com
+                              add --screen <host2> to carry Screen Sharing as well
+  doctor [--json]             check every piece and say how to fix what is wrong
+
+On your laptop:
+  client <host> [--user <name>] [--name <alias>] [--screen <host2>]
+                              add an SSH shortcut that goes through Cloudflare
+EOF
+  exit 2
+}
+
+say()  { printf '%s\n' "$*"; }
+step() { printf '\n== %s\n' "$*"; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+state_get() { [ -r "$STATE" ] && sed -n "s/^$1=//p" "$STATE" | tail -1; }
+state_set() {
+  mkdir -p "$(dirname "$STATE")"
+  touch "$STATE"
+  grep -v "^$1=" "$STATE" > "$STATE.tmp" || true
+  printf '%s=%s\n' "$1" "$2" >> "$STATE.tmp"
+  mv "$STATE.tmp" "$STATE"
+}
+
+need_macos() { [ "$(uname -s)" = "Darwin" ] || die "this runs on macOS only"; }
+need_sudo() {
+  sudo -n true 2>/dev/null && return 0
+  say "  This step needs this Mac's password:"
+  sudo -v
+}
+
+# ---------------------------------------------------------------- display
+
+display_install() {
+  need_macos
+  command -v swiftc >/dev/null || die "the command line developer tools are missing; run: xcode-select --install"
+  step "Building the virtual screen"
+  bash "$ROOT/display/build.sh" || die "the build failed"
+  mkdir -p "$HOME/.local/bin" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+  for old in $OLD_LABELS $LABEL; do
+    launchctl bootout "$GUI/$old" 2>/dev/null || true
+    [ "$old" = "$LABEL" ] || rm -f "$HOME/Library/LaunchAgents/$old.plist"
+  done
+  cp "$ROOT/display/factory-display" "$BIN"
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key><array><string>$BIN</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>StandardOutPath</key><string>$DISPLAY_LOG</string>
+  <key>StandardErrorPath</key><string>$DISPLAY_LOG</string>
+</dict>
+</plist>
+EOF
+  launchctl bootstrap "$GUI" "$PLIST" || die "launchd refused the login item; run this from Terminal on the Mac's own desktop"
+  sleep 3
+  display_status
+}
+
+display_uninstall() {
+  for old in $OLD_LABELS $LABEL; do
+    launchctl bootout "$GUI/$old" 2>/dev/null || true
+    rm -f "$HOME/Library/LaunchAgents/$old.plist"
+  done
+  rm -f "$BIN"
+  say "The virtual screen is removed."
+}
+
+display_label() {
+  for l in $LABEL $OLD_LABELS; do
+    launchctl print "$GUI/$l" >/dev/null 2>&1 && { echo "$l"; return 0; }
+  done
+  return 1
+}
+
+display_running() {
+  local l
+  l="$(display_label)" || return 1
+  launchctl print "$GUI/$l" 2>/dev/null | grep -q "state = running"
+}
+
+display_status() {
+  if display_running; then
+    say "The virtual screen is running: $(tail -1 "$DISPLAY_LOG" 2>/dev/null | sed 's/^[^:]*: //')"
+  else
+    say "The virtual screen is not running. Start it with: headless display install"
+    return 1
+  fi
+}
+
+# ---------------------------------------------------------------- setup
+
+setup() {
+  need_macos
+  step "Power"
+  need_sudo || die "sudo is needed for the power settings"
+  sudo pmset -a sleep 0 displaysleep 0 autorestart 1 && say "  never sleep, restart after a power cut: set"
+
+  step "Software updates"
+  sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticDownload -bool true
+  sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates -bool false
+  say "  download updates but do not install macOS updates by themselves: set"
+
+  step "Remote Login (SSH)"
+  if nc -z localhost 22 2>/dev/null; then
+    say "  already on"
+  elif sudo systemsetup -setremotelogin on 2>/dev/null && nc -z localhost 22 2>/dev/null; then
+    say "  turned on"
+  else
+    say "  macOS did not allow this from a script. Turn it on by hand (listed below)."
+  fi
+
+  display_install
+
+  step "Still to do by hand, in System Settings"
+  cat <<'EOF'
+  macOS only lets a person change these:
+  - Privacy & Security > FileVault: Off (automatic login needs it off)
+  - Users & Groups > Automatically log in as: your account
+  - Lock Screen > Require password after screen saver begins or display is turned off: Never
+  - General > Sharing > Screen Sharing: On
+  - General > Sharing > Remote Login: On (if the step above could not)
+
+  Then run: headless doctor
+  For access from anywhere: headless remote cloudflare <hostname on your Cloudflare domain>
+EOF
+}
+
+# ---------------------------------------------------------------- remote: cloudflare
+
+remote_cloudflare() {
+  need_macos
+  local host="" screen=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --screen) screen="${2:-}"; shift 2 || usage ;;
+      -*) usage ;;
+      *) host="$1"; shift ;;
+    esac
+  done
+  [ -n "$host" ] || usage
+  nc -z localhost 22 2>/dev/null || die "Remote Login is off on this Mac; turn it on first (headless setup)"
+
+  step "cloudflared"
+  command -v cloudflared >/dev/null || "$BREW" install cloudflared || die "could not install cloudflared"
+  if [ ! -r "$CF_DIR/cert.pem" ]; then
+    say "  A browser opens. Log in to Cloudflare, pick the domain for $host and click Authorize."
+    cloudflared tunnel login || die "the Cloudflare login did not finish"
+  fi
+
+  step "Tunnel"
+  local name id
+  name="$(scutil --get LocalHostName 2>/dev/null || hostname -s)"
+  id="$(cloudflared tunnel list -o json 2>/dev/null | /usr/bin/python3 -c 'import json,sys
+name=sys.argv[1]
+print(next((t["id"] for t in json.load(sys.stdin) if t["name"]==name), ""))' "$name")"
+  if [ -z "$id" ]; then
+    cloudflared tunnel create "$name" >/dev/null || die "could not create the tunnel"
+    id="$(cloudflared tunnel list -o json | /usr/bin/python3 -c 'import json,sys
+name=sys.argv[1]
+print(next((t["id"] for t in json.load(sys.stdin) if t["name"]==name), ""))' "$name")"
+  fi
+  [ -n "$id" ] && [ -r "$CF_DIR/$id.json" ] || die "tunnel '$name' exists but its credentials file is not on this Mac; delete the tunnel in the Cloudflare dashboard and run this again"
+  say "  tunnel '$name' ($id)"
+
+  [ -r "$CF_DIR/config.yml" ] && cp "$CF_DIR/config.yml" "$CF_DIR/config.yml.bak"
+  {
+    echo "tunnel: $id"
+    echo "credentials-file: $CF_DIR/$id.json"
+    echo "ingress:"
+    echo "  - hostname: $host"
+    echo "    service: ssh://localhost:22"
+    if [ -n "$screen" ]; then
+      echo "  - hostname: $screen"
+      echo "    service: tcp://localhost:5900"
+    fi
+    echo "  - service: http_status:404"
+  } > "$CF_DIR/config.yml"
+  cloudflared tunnel ingress validate >/dev/null || die "the tunnel config is not valid"
+
+  for h in $host $screen; do
+    cloudflared tunnel route dns "$name" "$h" 2>&1 | grep -qiE "added|already" \
+      && say "  $h points at the tunnel" \
+      || say "  could not add the DNS name $h. If a record with that name exists, remove it in Cloudflare and rerun."
+  done
+
+  step "Start at login"
+  mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+  launchctl bootout "$GUI/$CF_LABEL" 2>/dev/null || true
+  # cloudflared's own "service install" writes a login item without "tunnel run", which never connects.
+  cat > "$CF_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$CF_LABEL</string>
+  <key>ProgramArguments</key><array>
+    <string>$(command -v cloudflared)</string><string>tunnel</string>
+    <string>--config</string><string>$CF_DIR/config.yml</string><string>run</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>StandardOutPath</key><string>$HOME/Library/Logs/$CF_LABEL.out.log</string>
+  <key>StandardErrorPath</key><string>$HOME/Library/Logs/$CF_LABEL.err.log</string>
+</dict>
+</plist>
+EOF
+  launchctl bootstrap "$GUI" "$CF_PLIST" || die "launchd refused the login item"
+  state_set remote cloudflare
+  state_set host "$host"
+  state_set screen "$screen"
+  sleep 8
+
+  step "Lock it down (do this now)"
+  cat <<EOF
+  Until you do this, anyone on the internet can reach this Mac's SSH password prompt.
+  In the Cloudflare dashboard: Zero Trust > Access > Applications > Add an application > Self-hosted
+    - Hostname: $host${screen:+ (and a second application for $screen)}
+    - Policy: Allow, Emails, only your own email address
+  Then run: headless doctor     (it checks that the hostname asks for a login)
+
+  On your laptop:  headless client $host --user $(id -un)${screen:+ --screen $screen}
+EOF
+}
+
+# ---------------------------------------------------------------- client (laptop)
+
+client() {
+  local host="" user="" alias="mini" screen=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --user) user="${2:-}"; shift 2 || usage ;;
+      --name) alias="${2:-}"; shift 2 || usage ;;
+      --screen) screen="${2:-}"; shift 2 || usage ;;
+      -*) usage ;;
+      *) host="$1"; shift ;;
+    esac
+  done
+  [ -n "$host" ] || usage
+  [ -n "$user" ] || user="$(id -un)"
+  command -v cloudflared >/dev/null || "$BREW" install cloudflared || die "install cloudflared first: brew install cloudflared"
+
+  local cfg="$HOME/.ssh/config"
+  mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+  touch "$cfg" && chmod 600 "$cfg"
+  if grep -qE "^Host[[:space:]]+$alias([[:space:]]|\$)" "$cfg"; then
+    say "~/.ssh/config already has 'Host $alias'; left as it is."
+  else
+    cp "$cfg" "$cfg.bak-$(date +%Y%m%d%H%M%S)"
+    printf '\nHost %s\n  HostName %s\n  User %s\n  ProxyCommand cloudflared access ssh --hostname %%h\n' "$alias" "$host" "$user" >> "$cfg"
+    say "Added 'Host $alias' to ~/.ssh/config (the old file is backed up next to it)."
+  fi
+
+  local code
+  code="$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' "https://$host")"
+  case "$code" in
+    302*cloudflareaccess*) say "$host asks for a Cloudflare login: good." ;;
+    *) say "WARNING: $host does not ask for a Cloudflare login (got: ${code%% *}). Add the Access application before using it." ;;
+  esac
+  say ""
+  say "Connect:  ssh $alias        (a browser opens once for the Cloudflare login)"
+  if [ -n "$screen" ]; then
+    say "Screen:   cloudflared access tcp --hostname $screen --url localhost:5901 &"
+    say "          open vnc://localhost:5901"
+  fi
+}
+
+# ---------------------------------------------------------------- doctor
+
+RESULTS=""
+FAILS=0
+check() { # check <status> <name> <detail> [fix]
+  [ "$1" = fail ] && FAILS=$((FAILS + 1))
+  RESULTS="$RESULTS$1|$2|$3|${4:-}
+"
+}
+
+doctor() {
+  need_macos
+  local json=0
+  [ "${1:-}" = "--json" ] && json=1
+  local pm v
+
+  pm="$(pmset -g 2>/dev/null)"
+  v="$(echo "$pm" | awk '$1=="sleep"{print $2}')"
+  [ "$v" = "0" ] && check ok "Never sleep" "sleep 0" || check fail "Never sleep" "sleep is ${v:-unknown}" "sudo pmset -a sleep 0"
+  v="$(echo "$pm" | awk '$1=="autorestart"{print $2}')"
+  [ "$v" = "1" ] && check ok "Restart after a power cut" "autorestart 1" || check fail "Restart after a power cut" "autorestart is ${v:-unknown}" "sudo pmset -a autorestart 1"
+
+  v="$(defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser 2>/dev/null)"
+  if [ "$v" = "$(id -un)" ]; then check ok "Automatic login" "logs in as $v"
+  elif [ -n "$v" ]; then check warn "Automatic login" "logs in as $v, not $(id -un)" "System Settings > Users & Groups > Automatically log in as"
+  else check fail "Automatic login" "off; nothing starts after a reboot until someone logs in" "System Settings > Users & Groups > Automatically log in as"; fi
+
+  if fdesetup status 2>/dev/null | grep -q "FileVault is Off"; then check ok "FileVault" "off"
+  else check fail "FileVault" "on; automatic login cannot work" "System Settings > Privacy & Security > FileVault"; fi
+
+  v="$(defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates 2>/dev/null)"
+  [ "$v" = "0" ] && check ok "macOS updates" "not installed by themselves" || check warn "macOS updates" "may install by themselves and can break the virtual screen" "System Settings > General > Software Update > Automatic Updates"
+
+  nc -z localhost 22 2>/dev/null && check ok "Remote Login (SSH)" "port 22 answers" || check fail "Remote Login (SSH)" "off" "System Settings > General > Sharing > Remote Login"
+  nc -z localhost 5900 2>/dev/null && check ok "Screen Sharing" "port 5900 answers" || check warn "Screen Sharing" "off" "System Settings > General > Sharing > Screen Sharing"
+
+  if display_running; then
+    if system_profiler SPDisplaysDataType 2>/dev/null | grep -q "Factory Display"; then
+      check ok "Virtual screen" "$(tail -1 "$DISPLAY_LOG" 2>/dev/null | sed 's/^[^:]*: //')"
+    else
+      check fail "Virtual screen" "the program runs but macOS lists no Factory Display" "headless display install"
+    fi
+  else
+    check fail "Virtual screen" "not running" "headless display install"
+  fi
+
+  local remote host screen code
+  remote="$(state_get remote)"; host="$(state_get host)"; screen="$(state_get screen)"
+  if [ "$remote" = "cloudflare" ] && [ -n "$host" ]; then
+    if launchctl print "$GUI/$CF_LABEL" 2>/dev/null | grep -q "state = running"; then check ok "Cloudflare tunnel service" "running"
+    else check fail "Cloudflare tunnel service" "not running" "headless remote cloudflare $host"; fi
+    for h in $host $screen; do
+      code="$(curl -s -m 15 -o /dev/null -w '%{http_code} %{redirect_url}' "https://$h")"
+      case "$code" in
+        302*cloudflareaccess*) check ok "Access login on $h" "asks for a Cloudflare login" ;;
+        000*) check warn "Access login on $h" "could not reach it from here" "check the network, then rerun" ;;
+        *) check fail "Access login on $h" "OPEN to the internet (HTTP ${code%% *}); no Cloudflare login in front" "Cloudflare dashboard: Zero Trust > Access > Applications > Add an application > Self-hosted, hostname $h, allow only your email" ;;
+      esac
+    done
+  else
+    check warn "Access from anywhere" "not set up; this Mac is reachable on its own network only" "headless remote cloudflare <hostname>"
+  fi
+
+  if [ $json -eq 1 ]; then
+    printf '%s' "$RESULTS" | /usr/bin/python3 -c 'import json,sys
+rows=[dict(zip(("status","check","detail","fix"), l.rstrip("\n").split("|",3))) for l in sys.stdin if l.strip()]
+print(json.dumps({"ok": not any(r["status"]=="fail" for r in rows), "checks": rows}, indent=2))'
+  else
+    printf '%s' "$RESULTS" | while IFS='|' read -r st name detail fix; do
+      case "$st" in ok) mark="ok  " ;; warn) mark="WARN" ;; *) mark="FAIL" ;; esac
+      printf '  %s  %-28s %s\n' "$mark" "$name" "$detail"
+      [ "$st" != ok ] && [ -n "$fix" ] && printf '        fix: %s\n' "$fix"
+    done
+    [ $FAILS -eq 0 ] && say "" && say "All required checks pass." || { say ""; say "$FAILS check(s) failed."; }
+  fi
+  [ $FAILS -eq 0 ]
+}
+
+# ---------------------------------------------------------------- main
+
+[ $# -ge 1 ] || usage
+cmd="$1"; shift
+case "$cmd" in
+  setup) setup ;;
+  display)
+    case "${1:-}" in
+      install) display_install ;;
+      uninstall) display_uninstall ;;
+      status) display_status ;;
+      *) usage ;;
+    esac ;;
+  remote)
+    [ "${1:-}" = "cloudflare" ] || usage
+    shift; remote_cloudflare "$@" ;;
+  client) client "$@" ;;
+  doctor) doctor "${1:-}" ;;
+  *) usage ;;
+esac

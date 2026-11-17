@@ -39,6 +39,13 @@ Notes from setting up the first Mac minis by hand in November 2026. They explain
   `cloudflared` with no arguments.** It starts, prints "use `cloudflared tunnel run`" and never
   connects. `headless remote cloudflare` writes its own login item with
   `tunnel --config ... run`.
+- **`cloudflared` reads `~/.cloudflared/config.yml` even for management commands.** If that file
+  has a `tunnel:` line, `cloudflared tunnel route dns <other tunnel> <host>` quietly points the
+  hostname at the tunnel from the file, not the one you named. `invite` runs these commands with
+  an empty config and checks the tunnel id in the reply.
+- A join code is the hostname plus the tunnel's token. `join` turns the token into a
+  credentials file and runs the tunnel with a local config, the same form as a tunnel created
+  on the machine itself.
 - A new tunnel hostname is **open to everyone** until an Access application is added for it.
   A request to it returns HTTP 200. Once protected, it returns a 302 to
   `<team>.cloudflareaccess.com`. `doctor` and `client` test exactly that.

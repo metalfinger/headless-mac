@@ -6,6 +6,9 @@ What is planned, in rough order. Open an issue to suggest something.
 
 - [ ] Run `setup`, `remote cloudflare` and `client` end to end on a fresh Mac mini and fix what
       breaks. Update "What is tested" in the README.
+- [ ] Run `join` on a second Mac (login item, `--github` keys) and fix what breaks.
+- [ ] `invite`: create the Access application through the Cloudflare API when a token is given,
+      so the hostname is never open.
 - [ ] Test `--screen` (Screen Sharing through the tunnel).
 - [ ] `headless remote tailscale`: the same guided setup for people without a domain.
 - [ ] Show the tunnel's state in the virtual screen's menu ("Tunnel: connected").
@@ -20,4 +23,5 @@ What is planned, in rough order. Open an issue to suggest something.
 ## Done
 
 - 2026-11-17: virtual screen with size menu and saved choice; `headless` command with `setup`,
-  `display`, `remote cloudflare`, `doctor` and `client`; first public version.
+  `display`, `remote cloudflare`, `doctor` and `client`; first public version. Added `invite`
+  and `join` for setting up someone else's Mac through your own Cloudflare domain.

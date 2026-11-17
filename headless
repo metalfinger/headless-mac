@@ -31,6 +31,14 @@ On the Mac mini:
                               add --screen <host2> to carry Screen Sharing as well
   doctor [--json]             check every piece and say how to fix what is wrong
 
+Setting up a Mac for someone else, through your own Cloudflare domain:
+  invite <name> [--email <their email>] [--domain <domain>] [--screen]
+                              run on a Mac that is logged in to your Cloudflare. Creates the
+                              tunnel and hostname mini-<name>.<domain> and prints a join code
+  join <code> [--github <their GitHub username>] [--force]
+                              run on the other Mac. Connects it with the join code; no
+                              Cloudflare login there. --github installs their public SSH keys
+
 On your laptop:
   client <host> [--user <name>] [--name <alias>] [--screen <host2>]
                               add an SSH shortcut that goes through Cloudflare
@@ -300,6 +308,176 @@ client() {
   fi
 }
 
+# ---------------------------------------------------------------- invite / join
+
+# cloudflared reads ~/.cloudflared/config.yml by default, and a "tunnel:" line there silently
+# replaces the tunnel named on the command line. These calls must use an empty config.
+cf_clean() {
+  local empty rc
+  empty="$(mktemp)"
+  cloudflared tunnel --config "$empty" "$@"; rc=$?
+  rm -f "$empty"
+  return $rc
+}
+
+tunnel_id() { # tunnel_id <name>
+  cf_clean list -o json 2>/dev/null | /usr/bin/python3 -c 'import json,sys
+name=sys.argv[1]
+print(next((t["id"] for t in (json.load(sys.stdin) or []) if t["name"]==name), ""))' "$1"
+}
+
+invite() {
+  local name="" email="" domain="" screen=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --email) email="${2:-}"; shift 2 || usage ;;
+      --domain) domain="${2:-}"; shift 2 || usage ;;
+      --screen) screen=1; shift ;;
+      -*) usage ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+  [ -n "$name" ] || usage
+  case "$name" in *[!a-z0-9-]*) die "the name may only have lowercase letters, digits and hyphens" ;; esac
+  command -v cloudflared >/dev/null || die "cloudflared is missing; run: brew install cloudflared"
+  [ -r "$CF_DIR/cert.pem" ] || die "this Mac is not logged in to Cloudflare; run: cloudflared tunnel login"
+  if [ -z "$domain" ]; then
+    domain="$(state_get host | sed 's/^[^.]*\.//')"
+    [ -n "$domain" ] || die "say which domain to use: --domain example.com"
+  fi
+  local tunnel="mini-$name" host="mini-$name.$domain" shost="" id token code
+  [ $screen -eq 1 ] && shost="screen-$name.$domain"
+
+  step "Tunnel $tunnel"
+  id="$(tunnel_id "$tunnel")"
+  if [ -z "$id" ]; then
+    cf_clean create "$tunnel" >/dev/null 2>&1 || die "could not create the tunnel"
+    id="$(tunnel_id "$tunnel")"
+    # The other Mac runs it from the join code; the credentials file is not needed here.
+    rm -f "$CF_DIR/$id.json"
+    say "  created"
+  else
+    say "  already exists; reusing it"
+  fi
+  for h in $host $shost; do
+    cf_clean route dns --overwrite-dns "$id" "$h" 2>&1 | grep -qiE "(added|already).*tunnelID=$id" \
+      && say "  $h points at the tunnel" \
+      || die "could not point the DNS name $h at the tunnel"
+  done
+  token="$(cf_clean token "$id" 2>/dev/null | tail -1)"
+  [ -n "$token" ] || die "could not fetch the tunnel token"
+  code="$(printf 'v1 %s %s %s' "$host" "${shost:--}" "$token" | base64 | tr -d '\n')"
+
+  step "Add the login rule now (by hand)"
+  say "  Cloudflare dashboard: Zero Trust > Access > Applications > Add an application > Self-hosted"
+  say "    - Hostname: $host${shost:+   (and a second application for $shost)}"
+  say "    - Policy: Allow, Emails: ${email:-<their email>}   (add your own if you will help them)"
+  say "  Do it before the other Mac joins. Until the rule exists, the hostname is open to everyone."
+
+  step "On the other Mac"
+  say "  git clone https://github.com/metalfinger/headless-mac.git && cd headless-mac"
+  say "  ./headless join $code --github <their GitHub username>"
+  say ""
+  say "  The join code is a secret: it lets a machine serve this hostname. Send it privately."
+
+  step "On their laptop"
+  say "  ./headless client $host --user <their account name on that Mac>${shost:+ --screen $shost}"
+}
+
+write_tunnel_plist() { # write_tunnel_plist <args for cloudflared, one per line>
+  {
+    echo '<?xml version="1.0" encoding="UTF-8"?>'
+    echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+    echo '<plist version="1.0"><dict>'
+    echo "  <key>Label</key><string>$CF_LABEL</string>"
+    echo "  <key>ProgramArguments</key><array>"
+    echo "    <string>$(command -v cloudflared)</string>"
+    for a in "$@"; do echo "    <string>$a</string>"; done
+    echo "  </array>"
+    echo "  <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>"
+    echo "  <key>ThrottleInterval</key><integer>5</integer>"
+    echo "  <key>StandardOutPath</key><string>$HOME/Library/Logs/$CF_LABEL.out.log</string>"
+    echo "  <key>StandardErrorPath</key><string>$HOME/Library/Logs/$CF_LABEL.err.log</string>"
+    echo "</dict></plist>"
+  } > "$CF_PLIST"
+}
+
+join() {
+  need_macos
+  local code="" github="" force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --github) github="${2:-}"; shift 2 || usage ;;
+      --force) force=1; shift ;;
+      -*) usage ;;
+      *) code="$1"; shift ;;
+    esac
+  done
+  [ -n "$code" ] || usage
+  local decoded ver host shost token
+  decoded="$(printf '%s' "$code" | base64 -D 2>/dev/null)" || die "that is not a join code"
+  ver="$(echo "$decoded" | awk '{print $1}')"; host="$(echo "$decoded" | awk '{print $2}')"
+  shost="$(echo "$decoded" | awk '{print $3}')"; token="$(echo "$decoded" | awk '{print $4}')"
+  [ "$ver" = "v1" ] && [ -n "$host" ] && [ -n "$token" ] || die "that is not a join code"
+  [ "$shost" = "-" ] && shost=""
+  nc -z localhost 22 2>/dev/null || die "Remote Login is off on this Mac; turn it on first (headless setup)"
+  if [ -e "$CF_PLIST" ] && [ $force -eq 0 ]; then
+    die "this Mac already runs a Cloudflare tunnel at login; add --force to replace it"
+  fi
+
+  step "cloudflared"
+  command -v cloudflared >/dev/null || "$BREW" install cloudflared || die "could not install cloudflared"
+
+  step "Tunnel for $host"
+  mkdir -p "$CF_DIR" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+  chmod 700 "$CF_DIR"
+  # The token holds the tunnel's id and secret. Write them as a credentials file, the form
+  # cloudflared reads together with a local config (a bare token ignores local ingress rules).
+  local tid
+  tid="$( umask 077; printf '%s' "$token" | /usr/bin/python3 -c 'import base64,json,sys
+t=json.loads(base64.b64decode(sys.stdin.read().strip()+"=="))
+json.dump({"AccountTag":t["a"],"TunnelID":t["t"],"TunnelSecret":t["s"]}, open(sys.argv[1],"w"))
+print(t["t"])' "$CF_DIR/headless.json" )" || die "the join code is damaged"
+  chmod 600 "$CF_DIR/headless.json"
+  {
+    echo "tunnel: $tid"
+    echo "credentials-file: $CF_DIR/headless.json"
+    echo "ingress:"
+    echo "  - hostname: $host"
+    echo "    service: ssh://localhost:22"
+    if [ -n "$shost" ]; then
+      echo "  - hostname: $shost"
+      echo "    service: tcp://localhost:5900"
+    fi
+    echo "  - service: http_status:404"
+  } > "$CF_DIR/headless.yml"
+  launchctl bootout "$GUI/$CF_LABEL" 2>/dev/null || true
+  write_tunnel_plist tunnel --config "$CF_DIR/headless.yml" run
+  launchctl bootstrap "$GUI" "$CF_PLIST" || die "launchd refused the login item; run this from Terminal on the Mac's own desktop"
+  state_set remote cloudflare
+  state_set host "$host"
+  state_set screen "$shost"
+  say "  started; it also starts at every login"
+
+  if [ -n "$github" ]; then
+    step "SSH keys of github.com/$github"
+    local keys
+    keys="$(curl -fsS "https://github.com/$github.keys")" || die "could not read the keys of github.com/$github"
+    [ -n "$keys" ] || die "github.com/$github has no public SSH keys; add one on GitHub or use the Mac password"
+    mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+    touch "$HOME/.ssh/authorized_keys" && chmod 600 "$HOME/.ssh/authorized_keys"
+    echo "$keys" | while IFS= read -r key; do
+      [ -n "$key" ] || continue
+      grep -qxF "$key" "$HOME/.ssh/authorized_keys" || echo "$key" >> "$HOME/.ssh/authorized_keys"
+    done
+    say "  $(echo "$keys" | grep -c .) key(s) may log in as $(id -un); no Mac password needed for SSH"
+  fi
+
+  sleep 8
+  step "Check"
+  doctor ""
+}
+
 # ---------------------------------------------------------------- doctor
 
 RESULTS=""
@@ -395,6 +573,8 @@ case "$cmd" in
     [ "${1:-}" = "cloudflare" ] || usage
     shift; remote_cloudflare "$@" ;;
   client) client "$@" ;;
+  invite) invite "$@" ;;
+  join) join "$@" ;;
   doctor) doctor "${1:-}" ;;
   *) usage ;;
 esac

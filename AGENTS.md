@@ -17,6 +17,17 @@ through a Cloudflare Tunnel. Read `README.md` for the user-facing description.
   screen; anyone connected by Screen Sharing loses the picture. Say so before running it.
 - A hostname reported as "OPEN to the internet" is urgent. Tell the person at once.
 
+## "Set up this Mac" (when a person points you at this repo)
+
+1. `./headless doctor --json` to see the starting state.
+2. `./headless setup`. It needs the Mac's password for `sudo`; the person types it.
+3. If they gave you a join code: `./headless join <code> --github <their GitHub username>`.
+   Treat the code as a secret: do not print it back, log it or put it in a commit or a chat.
+4. `./headless doctor --json` again. Report every `warn` and `fail` with its `fix`. The ones
+   that are System Settings switches are theirs to change; list them plainly.
+5. Do not run `invite` or `remote cloudflare` unless the person owns the Cloudflare account on
+   that machine and asked for it.
+
 ## Changing the code
 
 - `headless` is bash and must run on macOS's own bash 3.2: no associative arrays, no `mapfile`,

@@ -56,8 +56,43 @@ ssh mini
 | `headless remote cloudflare <host> [--screen <host2>]` | mini | Tunnel SSH (and optionally Screen Sharing) through your Cloudflare domain |
 | `headless doctor [--json]` | mini | Check every piece; print the fix for each failure; exit 1 if any required check fails |
 | `headless client <host> [--user u] [--name alias] [--screen host2]` | laptop | Add an SSH shortcut that goes through Cloudflare |
+| `headless invite <name> [--email e] [--domain d] [--screen]` | your Mac | Create a tunnel and hostname `mini-<name>.<domain>` for someone else's Mac and print a join code |
+| `headless join <code> [--github user] [--force]` | their Mac | Connect that Mac with the join code. No Cloudflare login there |
 
 Everything is safe to run again. Finished steps are skipped or rewritten to the same result.
+
+## Setting up a Mac for someone else
+
+If you own the Cloudflare domain and a friend or teammate owns the Mac:
+
+1. **You**, on a Mac that is logged in to your Cloudflare (`cloudflared tunnel login`):
+   ```sh
+   ./headless invite sam --email sam@example.com --domain example.com
+   ```
+   This creates a tunnel and the hostname `mini-sam.example.com`, and prints a join code.
+   Add the Access application for that hostname straight away, allowing their email (the
+   command prints the exact steps).
+2. **On their Mac** (they, you, or a coding agent pointed at this repo):
+   ```sh
+   git clone https://github.com/metalfinger/headless-mac.git && cd headless-mac
+   ./headless setup
+   ./headless join <code> --github <their GitHub username>
+   ```
+   No Cloudflare login happens on their Mac and none of your account's keys are left there.
+   The join code can run that one tunnel and nothing else. `--github` lets their GitHub SSH
+   keys log in, so SSH never asks for the Mac password.
+3. **They**, on their laptop:
+   ```sh
+   ./headless client mini-sam.example.com --user <their account name on the Mac>
+   ssh mini
+   ```
+   A browser opens, they type their email and Cloudflare sends them a one-time code.
+
+The join code is a secret. Send it privately. To cut access, delete the tunnel
+(`cloudflared tunnel delete mini-sam`) and the Access application.
+
+Their access runs through your Cloudflare account: you can remove it, and it stops if your
+account or domain does. Say so when you set it up.
 
 ## The virtual screen
 
@@ -101,6 +136,8 @@ hostname asks for a Cloudflare login. `--json` prints the same as
 | `doctor` | Tested on that mini |
 | Cloudflare SSH tunnel with Access login | Tested there, set up by hand with the same commands the script runs |
 | `setup`, `remote cloudflare`, `client` as scripts | Written from those tested commands; not yet run end to end on a fresh Mac |
+| `invite`: tunnel, DNS name, join code | Tested once |
+| `join` | Its tunnel config was run by hand and carried SSH. The command itself (login item, `--github` keys) has not run on a second Mac yet |
 | `--screen` (Screen Sharing through the tunnel) | Not tested |
 | Intel Macs, macOS before 27 | Not tested |
 

@@ -112,6 +112,12 @@ launchctl bootout gui/$(id -u)/com.cloudflare.cloudflared; rm ~/Library/LaunchAg
 cloudflared tunnel delete <tunnel name>      # also remove the DNS record and Access application
 ```
 
+## More
+
+- [How it works, and what we learned](docs/how-it-works.md)
+- [Roadmap](ROADMAP.md)
+- [Notes for coding agents](AGENTS.md)
+
 ## Licence
 
 MIT. See `LICENSE`.

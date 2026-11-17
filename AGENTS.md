@@ -28,3 +28,4 @@ through a Cloudflare Tunnel. Read `README.md` for the user-facing description.
 - Keep every command safe to run twice.
 - Keep README's "What is tested" table honest: mark anything you add as untested until it has
   run on a real Mac.
+- When behaviour changes, update `README.md`, `docs/how-it-works.md` and `ROADMAP.md` in the same commit.
